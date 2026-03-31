@@ -260,7 +260,10 @@ def _samefile(src, dst):
     # Macintosh, Unix.
     if isinstance(src, os.DirEntry) and hasattr(os.path, 'samestat'):
         try:
-            return os.path.samestat(src.stat(), os.stat(dst))
+            st_src = src.stat()
+            # DirEntry.stat() on junctions can have unreliable st_dev/st_ino
+            if not (os.name == 'nt' and (st_src.st_dev == 0 or st_src.st_ino == 0)):
+                return os.path.samestat(st_src, os.stat(dst))
         except OSError:
             return False
 
@@ -543,7 +546,10 @@ def ignore_patterns(*patterns):
     return _ignore_patterns
 
 def _copytree(entries, src, dst, symlinks, ignore, copy_function,
-              ignore_dangling_symlinks, dirs_exist_ok=False):
+              ignore_dangling_symlinks, dirs_exist_ok=False, _visited_junctions=None):
+    if _visited_junctions is None:
+        _visited_junctions = set()
+
     if ignore is not None:
         ignored_names = ignore(os.fspath(src), [x.name for x in entries])
     else:
@@ -561,12 +567,47 @@ def _copytree(entries, src, dst, symlinks, ignore, copy_function,
         srcobj = srcentry if use_srcentry else srcname
         try:
             is_symlink = srcentry.is_symlink()
-            if is_symlink and os.name == 'nt':
-                # Special check for directory junctions, which appear as
-                # symlinks but we want to recurse.
-                lstat = srcentry.stat(follow_symlinks=False)
-                if lstat.st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT:
-                    is_symlink = False
+
+            # Windows junction handling
+            if os.name == 'nt':
+                try:
+                    junction = srcentry.is_junction()
+                except (OSError, AttributeError):
+                    junction = False
+
+                if junction:
+                    if symlinks:
+                        try:
+                            target = os.readlink(srcname)
+                            # Normalize target path for CreateJunction
+                            if not os.path.isabs(target):
+                                # Convert relative path to absolute
+                                target = os.path.join(os.path.dirname(srcname), target)
+                            target = os.path.normpath(target)
+
+                            _winapi.CreateJunction(target, dstname)
+                            copystat(srcobj, dstname, follow_symlinks=False)
+                        except OSError as e:
+                            if e.winerror == 1:  # ERROR_INVALID_FUNCTION
+                                error_msg = f"Invalid junction path format: {target}"
+                            elif e.winerror == 3:  # ERROR_PATH_NOT_FOUND
+                                error_msg = f"Junction target not found: {target}"
+                            else:
+                                error_msg = str(e)
+                            errors.append((srcname, dstname, error_msg))
+                        continue
+                    else:
+                        # Follow the junction like a directory - check for cycles
+                        try:
+                            junction_target = os.path.realpath(srcname)
+                            if junction_target in _visited_junctions:
+                                errors.append((srcname, dstname, "Junction cycle detected"))
+                                continue
+                            _visited_junctions.add(junction_target)
+                        except OSError:
+                            pass  # Proceed anyway if realpath fails
+                        # Follow the junction like a directory
+                        is_symlink = False
             if is_symlink:
                 linkto = os.readlink(srcname)
                 if symlinks:
@@ -581,14 +622,18 @@ def _copytree(entries, src, dst, symlinks, ignore, copy_function,
                         continue
                     # otherwise let the copy occur. copy2 will raise an error
                     if srcentry.is_dir():
-                        copytree(srcobj, dstname, symlinks, ignore,
+                        with os.scandir(srcobj) as sub_itr:
+                            sub_entries = list(sub_itr)
+                        _copytree(sub_entries, srcobj, dstname, symlinks, ignore,
                                  copy_function, ignore_dangling_symlinks,
-                                 dirs_exist_ok)
+                                 dirs_exist_ok, _visited_junctions)
                     else:
                         copy_function(srcobj, dstname)
             elif srcentry.is_dir():
-                copytree(srcobj, dstname, symlinks, ignore, copy_function,
-                         ignore_dangling_symlinks, dirs_exist_ok)
+                with os.scandir(srcobj) as sub_itr:
+                    sub_entries = list(sub_itr)
+                _copytree(sub_entries, srcobj, dstname, symlinks, ignore, copy_function,
+                         ignore_dangling_symlinks, dirs_exist_ok, _visited_junctions)
             else:
                 # Will raise a SpecialFileError for unsupported file types
                 copy_function(srcobj, dstname)
@@ -654,7 +699,7 @@ def copytree(src, dst, symlinks=False, ignore=None, copy_function=copy2,
     return _copytree(entries=entries, src=src, dst=dst, symlinks=symlinks,
                      ignore=ignore, copy_function=copy_function,
                      ignore_dangling_symlinks=ignore_dangling_symlinks,
-                     dirs_exist_ok=dirs_exist_ok)
+                     dirs_exist_ok=dirs_exist_ok, _visited_junctions=None)
 
 if hasattr(os.stat_result, 'st_file_attributes'):
     def _rmtree_islink(st):

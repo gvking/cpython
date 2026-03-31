@@ -1099,6 +1099,131 @@ class TestCopyTree(BaseTest, unittest.TestCase):
         rv = shutil.copytree(src_dir, dst_dir)
         self.assertEqual(['pol'], os.listdir(rv))
 
+    @unittest.skipUnless(_winapi, 'Windows only')
+    def test_copytree_junctions_symlinks_true(self):
+        tmp = self.mkdtemp()
+        src_dir = os.path.join(tmp, 'src')
+        target_dir = os.path.join(tmp, 'target')
+        os.makedirs(src_dir)
+        os.makedirs(target_dir)
+        create_file((target_dir, 'file.txt'), 'test')
+
+        junction = os.path.join(src_dir, 'link')
+        _winapi.CreateJunction(target_dir, junction)
+
+        dst_dir = os.path.join(tmp, 'dst')
+        shutil.copytree(src_dir, dst_dir, symlinks=True)
+
+        dst_junction = os.path.join(dst_dir, 'link')
+        self.assertTrue(os.path.exists(dst_junction))
+        stat_info = os.lstat(dst_junction)
+        self.assertEqual(stat_info.st_reparse_tag, stat.IO_REPARSE_TAG_MOUNT_POINT)
+
+        # Content accessible
+        self.assertEqual(read_file(os.path.join(dst_junction, 'file.txt')), 'test')
+
+    @unittest.skipUnless(_winapi, 'Windows only')
+    def test_copytree_junctions_symlinks_false(self):
+        tmp = self.mkdtemp()
+        src_dir = os.path.join(tmp, 'src')
+        target_dir = os.path.join(tmp, 'target')
+        os.makedirs(src_dir)
+        os.makedirs(target_dir)
+        create_file((target_dir, 'file.txt'), 'test')
+
+        junction = os.path.join(src_dir, 'link')
+        _winapi.CreateJunction(target_dir, junction)
+
+        dst_dir = os.path.join(tmp, 'dst')
+        shutil.copytree(src_dir, dst_dir, symlinks=False)
+
+        dst_content = os.path.join(dst_dir, 'link')
+        self.assertTrue(os.path.isdir(dst_content))
+        self.assertFalse(os.path.islink(dst_content))
+
+        # Directory contents should be copied, not a junction
+        self.assertEqual(read_file(os.path.join(dst_content, 'file.txt')), 'test')
+
+    @unittest.skipUnless(_winapi, 'Windows only')
+    def test_copytree_broken_junction(self):
+        tmp = self.mkdtemp()
+        src_dir = os.path.join(tmp, 'src')
+        os.makedirs(src_dir)
+
+        nonexistent = os.path.join(tmp, 'nonexistent')
+        broken = os.path.join(src_dir, 'broken')
+        try:
+            _winapi.CreateJunction(nonexistent, broken)
+        except OSError:
+            self.skipTest("Cannot create broken junction")
+
+        dst_dir = os.path.join(tmp, 'dst')
+        with self.assertRaises(shutil.Error):
+            shutil.copytree(src_dir, dst_dir, symlinks=True)
+
+    @unittest.skipUnless(_winapi, 'Windows only')
+    def test_copytree_junction_cycle_detection(self):
+        tmp = self.mkdtemp()
+        dir_a = os.path.join(tmp, 'a')
+        dir_b = os.path.join(tmp, 'b')
+        os.makedirs(dir_a)
+        os.makedirs(dir_b)
+
+        # Create cycle: a/link_to_b -> b, b/link_to_a -> a
+        junction_ab = os.path.join(dir_a, 'link_to_b')
+        junction_ba = os.path.join(dir_b, 'link_to_a')
+        _winapi.CreateJunction(dir_b, junction_ab)
+        _winapi.CreateJunction(dir_a, junction_ba)
+
+        dst_dir = os.path.join(tmp, 'dst')
+        with self.assertRaises(shutil.Error) as cm:
+            shutil.copytree(dir_a, dst_dir, symlinks=False)
+
+        # Should detect junction cycle
+        error_found = any('Junction cycle detected' in str(error) for error in cm.exception.args[0])
+        self.assertTrue(error_found, "Expected junction cycle detection error")
+
+    @unittest.skipUnless(_winapi, 'Windows only')
+    def test_copytree_junction_file_truncation_bug(self):
+        """Test that copytree doesn't truncate files when copying over junctions."""
+        tmp = self.mkdtemp()
+
+        source_dir = os.path.join(tmp, 'source')
+        project1_dir = os.path.join(tmp, 'project1')
+        project2_dir = os.path.join(tmp, 'project2')
+
+        os.makedirs(source_dir)
+        os.makedirs(project1_dir)
+        os.makedirs(project2_dir)
+
+        hello_file = os.path.join(source_dir, 'hello.py')
+        original_content = 'print("world")'
+        create_file(hello_file, original_content)
+
+        # Both projects junction to same source
+        project1_test = os.path.join(project1_dir, 'test')
+        project2_test = os.path.join(project2_dir, 'test')
+        _winapi.CreateJunction(source_dir, project1_test)
+        _winapi.CreateJunction(source_dir, project2_test)
+
+        # This used to truncate source files
+        try:
+            shutil.copytree(project1_dir, project2_dir, dirs_exist_ok=True, symlinks=True)
+        except shutil.Error:
+            pass  # Expected when junction already exists
+
+        # Source file should not be truncated
+        actual_content = read_file(hello_file)
+        self.assertEqual(actual_content, original_content)
+        self.assertGreater(len(actual_content), 0, "File was truncated to 0 bytes!")
+
+        self.assertTrue(os.path.exists(project1_test))
+        self.assertTrue(os.path.exists(project2_test))
+        project1_hello = os.path.join(project1_test, 'hello.py')
+        project2_hello = os.path.join(project2_test, 'hello.py')
+        self.assertEqual(read_file(project1_hello), original_content)
+        self.assertEqual(read_file(project2_hello), original_content)
+
 class TestCopy(BaseTest, unittest.TestCase):
 
     ### shutil.copymode
